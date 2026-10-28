@@ -1,10 +1,12 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import confetti from 'canvas-confetti';
-import { AVATAR_OPTIONS, ESCAPE_STAGES, PuzzleHotspot } from './data/escapeData';
+import { AVATAR_OPTIONS, ESCAPE_STAGES, InventoryItem, PuzzleHotspot } from './data/escapeData';
 import { createRoomSupabaseClient, getPlayerCredentials } from './lib/supabase';
 import { FacilityMap, PlayerInfo } from './components/FacilityMap';
 import { PuzzleModal } from './components/PuzzleModal';
 import { TextbookGuideModal } from './components/TextbookGuideModal';
+import { InteractiveRoomScene } from './components/InteractiveRoomScene';
+import { InventoryBar } from './components/InventoryBar';
 import {
   Users,
   Sparkles,
@@ -17,8 +19,6 @@ import {
   KeyRound,
   Trophy,
   LogOut,
-  CheckCircle2,
-  Lock,
   UserCheck,
   ShieldAlert,
   RefreshCw,
@@ -75,7 +75,11 @@ export function App() {
   const [players, setPlayers] = useState<PlayerInfo[]>([]);
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [activeViewStage, setActiveViewStage] = useState<number>(1);
+
+  // Point-and-Click Puzzle & Inventory State
   const [activePuzzle, setActivePuzzle] = useState<PuzzleHotspot | null>(null);
+  const [usedItemForModal, setUsedItemForModal] = useState<string | null>(null);
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
 
   // Modals & UI Helpers
   const [showMapModal, setShowMapModal] = useState<boolean>(false);
@@ -91,6 +95,24 @@ export function App() {
   const getAvatarObj = (avatarId: string) => {
     return AVATAR_OPTIONS.find((a) => a.id === avatarId) || AVATAR_OPTIONS[0];
   };
+
+  // Derive all collected inventory items from solved_puzzles across the team
+  const collectedInventoryItems: InventoryItem[] = useMemo(() => {
+    if (!room) return [];
+    const list: InventoryItem[] = [];
+    for (const stage of ESCAPE_STAGES) {
+      for (const puzzle of stage.puzzles) {
+        if (room.solved_puzzles.includes(puzzle.id) && puzzle.rewardItem) {
+          list.push(puzzle.rewardItem);
+        }
+      }
+    }
+    return list;
+  }, [room]);
+
+  const selectedInventoryItem = useMemo(() => {
+    return collectedInventoryItems.find((i) => i.id === selectedItemId) || null;
+  }, [collectedInventoryItems, selectedItemId]);
 
   // Fetch full room state via verified RPC
   const fetchRoomState = useCallback(
@@ -119,10 +141,10 @@ export function App() {
         setPlayers(data.players || []);
         setLogs(data.logs || []);
 
-        // Automatically advance view stage when team unlocks a new stage
         if (fetchedRoom.current_stage > prevStageRef.current) {
           prevStageRef.current = fetchedRoom.current_stage;
           setActiveViewStage(fetchedRoom.current_stage);
+          setSelectedItemId(null);
           confetti({ particleCount: 70, spread: 60, origin: { y: 0.6 } });
         }
 
@@ -137,7 +159,7 @@ export function App() {
     [myUid, myToken]
   );
 
-  // Realtime subscription + fast fallback poll for multi-device reliability
+  // Realtime subscription + fallback poll
   useEffect(() => {
     if (!activeRoomCode) return;
 
@@ -254,7 +276,7 @@ export function App() {
     }
   };
 
-  // Update my avatar or nickname inside waiting lobby or game
+  // Update my avatar or nickname
   const handleUpdateMyProfile = async (newAvatarId: string, newNick?: string) => {
     setSelectedAvatar(newAvatarId);
     localStorage.setItem('panda_avatar', newAvatarId);
@@ -312,15 +334,13 @@ export function App() {
     }
   };
 
-  // Solve a Puzzle
+  // Solve a Puzzle & Automatically Receive Reward Item in Inventory
   const handleSolvePuzzle = async (puzzle: PuzzleHotspot) => {
     if (!activeRoomCode) return;
     const client = createRoomSupabaseClient(activeRoomCode);
     const msg = puzzle.isStageFinal
-      ? `🎉 [${nickname}] 대원이 제${puzzle.stageNum}방 최종 잠금장치(${puzzle.title})를 해제하여 다음 방을 열었습니다!`
-      : `✨ [${nickname}] 대원이 제${puzzle.stageNum}방의 [${puzzle.title}] 단서를 해독했습니다! ${
-          puzzle.rewardDigit ? `(코드 숫자 [${puzzle.rewardDigit}] 획득!)` : ''
-        }`;
+      ? `🎉 [${nickname}] 대원이 [${puzzle.rewardItem.icon} ${puzzle.rewardItem.name}]을(를) 획득하고 제${puzzle.stageNum}방 최종 잠금장치를 해제했습니다!`
+      : `✨ [${nickname}] 대원이 [${puzzle.title}] 단서를 풀어 인벤토리 아이템 [${puzzle.rewardItem.icon} ${puzzle.rewardItem.name}]을(를) 획득했습니다!`;
 
     const { error } = await client.rpc('submit_puzzle_solution', {
       p_room_code: activeRoomCode,
@@ -337,6 +357,14 @@ export function App() {
       setErrorBanner(error.message);
       return;
     }
+
+    // Automatically select the newly acquired key/tool so the user can immediately see it in inventory
+    if (puzzle.rewardItem && !puzzle.isStageFinal) {
+      setSelectedItemId(puzzle.rewardItem.id);
+    } else {
+      setSelectedItemId(null);
+    }
+
     await fetchRoomState(activeRoomCode);
   };
 
@@ -365,6 +393,7 @@ export function App() {
     setRoom(null);
     setPlayers([]);
     setLogs([]);
+    setSelectedItemId(null);
     setErrorBanner(null);
   };
 
@@ -383,7 +412,6 @@ export function App() {
 
     return (
       <div className="min-h-screen bg-gradient-to-b from-slate-950 via-emerald-950/30 to-slate-950 text-slate-100 flex flex-col">
-        {/* Top Header */}
         <header className="border-b border-emerald-500/20 bg-slate-950/80 backdrop-blur-md sticky top-0 z-30">
           <div className="max-w-6xl mx-auto px-4 py-3.5 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -393,12 +421,12 @@ export function App() {
               <div>
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-extrabold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    미래엔 중학교 중국어 1~3과
+                    미래엔 중학교 중국어 1~3과 · 포인트 앤 클릭 방탈출
                   </span>
                   <span className="text-xs font-bold text-amber-300">2~5인 실시간 협동 멀티플레이</span>
                 </div>
                 <h1 className="text-lg sm:text-xl font-black tracking-tight text-white">
-                  판다 연구소 구출 작전 : 5개의 방을 탈출하라!
+                  판다 연구소 구출 작전 : 손전등과 인벤토리로 5개의 방을 탈출하라!
                 </h1>
               </div>
             </div>
@@ -445,7 +473,6 @@ export function App() {
                 </p>
               </div>
 
-              {/* Selected Avatar Preview Pill */}
               <div className="flex items-center gap-3 px-4 py-2.5 rounded-2xl bg-slate-800/90 border border-emerald-500/40">
                 <span className="text-3xl">{currentAvatar.emoji}</span>
                 <div>
@@ -457,7 +484,6 @@ export function App() {
               </div>
             </div>
 
-            {/* Nickname Input */}
             <div className="max-w-md">
               <label className="block text-xs sm:text-sm font-bold text-slate-200 mb-1.5">
                 내 이름 (닉네임 또는 중국어 이름)
@@ -472,7 +498,6 @@ export function App() {
               />
             </div>
 
-            {/* 5 Avatar Cards */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               {AVATAR_OPTIONS.map((av) => {
                 const isSelected = selectedAvatar === av.id;
@@ -511,7 +536,6 @@ export function App() {
 
           {/* STEP 2: Create Room (2,3,4,5 players) OR Join Room by PIN */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Create Room Card */}
             <form
               onSubmit={handleCreateRoom}
               className="rounded-3xl border border-emerald-500/40 bg-gradient-to-br from-emerald-950/40 via-slate-900 to-slate-900 p-6 shadow-xl flex flex-col justify-between space-y-5"
@@ -578,7 +602,6 @@ export function App() {
               </button>
             </form>
 
-            {/* Join Room by PIN Card */}
             <form
               onSubmit={handleJoinRoom}
               className="rounded-3xl border border-amber-500/40 bg-gradient-to-br from-amber-950/30 via-slate-900 to-slate-900 p-6 shadow-xl flex flex-col justify-between space-y-5"
@@ -624,7 +647,6 @@ export function App() {
             </form>
           </div>
 
-          {/* Preview of Whole Escape Map on Home Screen */}
           <section className="space-y-3">
             <FacilityMap
               currentStage={1}
@@ -656,16 +678,15 @@ export function App() {
   }
 
   // ============================================================================
-  // VIEW 2: WAITING ROOM LOBBY (2~5 Players gather, customize avatar, see full map)
+  // VIEW 2: WAITING ROOM LOBBY
   // ============================================================================
   if (room.status === 'waiting') {
-    const canStart = players.length >= 1; // Allow starting immediately or when 2~5 gather
+    const canStart = players.length >= 1;
     const isEnoughPlayers = players.length >= room.target_players;
 
     return (
       <div className="min-h-screen bg-gradient-to-b from-slate-950 via-emerald-950/25 to-slate-950 text-slate-100 p-4 sm:p-6">
         <div className="max-w-5xl mx-auto space-y-6">
-          {/* Top Bar */}
           <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-2xl bg-slate-900/90 border border-emerald-500/30">
             <div className="flex items-center gap-3">
               <span className="text-3xl">🐼</span>
@@ -699,9 +720,7 @@ export function App() {
             </div>
           </div>
 
-          {/* Big PIN Banner & Player Slots */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* PIN Box */}
             <div className="rounded-3xl border-2 border-amber-400/60 bg-slate-900/95 p-6 flex flex-col items-center justify-center text-center space-y-4 shadow-xl">
               <span className="text-xs font-extrabold px-3 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-400/30">
                 실시간 멀티플레이 입장 코드
@@ -722,7 +741,6 @@ export function App() {
               </p>
             </div>
 
-            {/* Connected Players List (2~5 Slots) */}
             <div className="lg:col-span-2 rounded-3xl border border-emerald-500/30 bg-slate-900/95 p-6 flex flex-col justify-between space-y-5">
               <div>
                 <div className="flex items-center justify-between mb-3">
@@ -800,7 +818,6 @@ export function App() {
                 </div>
               </div>
 
-              {/* Quick Avatar Switcher in Waiting Room */}
               <div className="pt-3 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-1.5">
                   <span className="text-xs text-slate-400 mr-1">내 아바타 변경:</span>
@@ -834,7 +851,6 @@ export function App() {
             </div>
           </div>
 
-          {/* Full Escape Map Preview in Lobby */}
           <FacilityMap
             currentStage={room.current_stage}
             unlockedStages={room.unlocked_stages}
@@ -852,7 +868,7 @@ export function App() {
   }
 
   // ============================================================================
-  // VIEW 3: ACTIVE MULTIPLAYER ESCAPE ROOM GAMEPLAY & COMPLETION SCREEN
+  // VIEW 3: POINT-AND-CLICK ESCAPE ROOM GAMEPLAY + INVENTORY + FLASHLIGHT
   // ============================================================================
   const currentStageObj = ESCAPE_STAGES.find((s) => s.stageNum === activeViewStage) || ESCAPE_STAGES[0];
   const stageNonFinalPuzzles = currentStageObj.puzzles.filter((p) => !p.isStageFinal);
@@ -880,7 +896,6 @@ export function App() {
       {/* Top Game HUD Header */}
       <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur-md">
         <div className="max-w-7xl mx-auto px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-2">
-          {/* Team & PIN Info */}
           <div className="flex items-center gap-2.5">
             <span className="text-2xl">🐼</span>
             <div>
@@ -987,144 +1002,31 @@ export function App() {
 
       {/* Main Content Grid */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-5 py-4 grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* LEFT/CENTER COLUMN (8 cols): Interactive Escape Room Scene + Always-Visible Full Map */}
-        <div className="lg:col-span-8 space-y-5">
-          {/* Interactive Room Stage Canvas */}
-          <div
-            className={`relative rounded-3xl border border-emerald-500/40 bg-gradient-to-br ${currentStageObj.bgThemeClass} p-5 sm:p-6 shadow-2xl overflow-hidden`}
-          >
-            {/* Stage Header */}
-            <div className="flex flex-wrap items-start justify-between gap-3 pb-4 border-b border-white/10">
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs font-extrabold px-2.5 py-0.5 rounded-full bg-amber-400 text-slate-950">
-                    제{currentStageObj.stageNum}방 / 5방
-                  </span>
-                  <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-white/10 text-emerald-200 border border-white/15">
-                    {currentStageObj.lessonBadge}
-                  </span>
-                </div>
-                <h2 className="text-xl sm:text-2xl font-black text-white mt-1.5 flex items-center gap-2">
-                  <span>{currentStageObj.name}</span>
-                  <span className="text-sm sm:text-base font-bold text-amber-300">
-                    ({currentStageObj.chineseTitle})
-                  </span>
-                </h2>
-                <p className="text-xs sm:text-sm text-slate-300 mt-1 leading-relaxed">
-                  {currentStageObj.storyIntro}
-                </p>
-              </div>
-            </div>
+        {/* LEFT/CENTER COLUMN (8 cols): Point-and-Click Room View + Bottom Inventory Bar + Full Escape Map */}
+        <div className="lg:col-span-8 space-y-4">
+          {/* 1. Point-and-Click Room View with Radial-Gradient Flashlight */}
+          <InteractiveRoomScene
+            stage={currentStageObj}
+            solvedPuzzles={room.solved_puzzles}
+            unlockedStages={room.unlocked_stages}
+            selectedItem={selectedInventoryItem}
+            playersInRoom={players.filter((p) => p.current_room_view === currentStageObj.stageNum)}
+            onOpenPuzzle={(puzzle, usedItemName) => {
+              setUsedItemForModal(usedItemName || null);
+              setActivePuzzle(puzzle);
+            }}
+            onSelectStage={handleSelectStage}
+          />
 
-            {/* Interactive Scene Canvas with 3 Clue Hotspots */}
-            <div className="relative mt-4 h-[330px] sm:h-[380px] rounded-2xl border border-white/15 bg-slate-950/60 overflow-hidden">
-              {/* Ambient Decorative Background */}
-              <div
-                className="absolute inset-0 opacity-15 pointer-events-none"
-                style={{
-                  backgroundImage:
-                    'radial-gradient(circle at 25% 30%, #10b981 0%, transparent 45%), radial-gradient(circle at 75% 65%, #f59e0b 0%, transparent 45%)',
-                }}
-              />
+          {/* 2. Bottom Inventory Bar (Item Selection, Combination, Inspection) */}
+          <InventoryBar
+            items={collectedInventoryItems}
+            selectedItemId={selectedItemId}
+            onSelectItem={(item) => setSelectedItemId(item ? item.id : null)}
+            currentStage={currentStageObj.stageNum}
+          />
 
-              {/* Mission Goal Banner inside canvas */}
-              <div className="absolute top-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 rounded-xl bg-slate-900/90 border border-slate-700/80 text-xs">
-                <span className="font-bold text-amber-300">🎯 방 탈출 목표: {currentStageObj.missionGoal}</span>
-                <span className="text-slate-400">아이콘을 클릭해 중국어 단서를 조사하세요!</span>
-              </div>
-
-              {/* Hotspot Buttons */}
-              {currentStageObj.puzzles.map((puzzle, idx) => {
-                const isSolved = room.solved_puzzles.includes(puzzle.id);
-                const isLockedFinal = puzzle.isStageFinal && !canSolveStageFinal && !isSolved;
-
-                return (
-                  <button
-                    key={puzzle.id}
-                    type="button"
-                    onClick={() => setActivePuzzle(puzzle)}
-                    style={{
-                      left: `${puzzle.xPercent}%`,
-                      top: `${puzzle.yPercent}%`,
-                    }}
-                    className={`group absolute -translate-x-1/2 -translate-y-1/2 p-3 sm:p-4 rounded-2xl border-2 transition-all duration-200 flex flex-col items-center text-center w-36 sm:w-44 cursor-pointer ${
-                      isSolved
-                        ? 'bg-emerald-950/90 border-emerald-400 shadow-lg shadow-emerald-500/20'
-                        : isLockedFinal
-                        ? 'bg-slate-900/90 border-slate-600 opacity-85 hover:border-amber-400/60'
-                        : 'bg-slate-900/95 border-amber-400 shadow-xl shadow-amber-500/25 hover:scale-105 animate-pulse'
-                    }`}
-                  >
-                    <div className="relative">
-                      <span className="text-3xl sm:text-4xl block">{puzzle.iconEmoji}</span>
-                      <span
-                        className={`absolute -top-2 -right-3 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-black ${
-                          isSolved
-                            ? 'bg-emerald-400 text-slate-950'
-                            : isLockedFinal
-                            ? 'bg-slate-700 text-slate-300'
-                            : 'bg-amber-400 text-slate-950'
-                        }`}
-                      >
-                        {isSolved ? '✓' : idx + 1}
-                      </span>
-                    </div>
-
-                    <div className="font-extrabold text-xs sm:text-sm text-white mt-2 line-clamp-1">
-                      {puzzle.objectName}
-                    </div>
-
-                    <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-black/40">
-                      {isSolved ? (
-                        <span className="text-emerald-300 flex items-center gap-1">
-                          <CheckCircle2 className="w-3 h-3" /> 해독 완료
-                        </span>
-                      ) : isLockedFinal ? (
-                        <span className="text-slate-400 flex items-center gap-1">
-                          <Lock className="w-3 h-3" /> 선행 단서 필요
-                        </span>
-                      ) : (
-                        <span className="text-amber-300">🔍 단서 조사하기</span>
-                      )}
-                    </div>
-                  </button>
-                );
-              })}
-
-              {/* Teammates currently exploring this room */}
-              <div className="absolute bottom-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 rounded-xl bg-slate-950/85 border border-slate-800/90">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-[11px] font-bold text-slate-400">이 방에 있는 대원:</span>
-                  {players
-                    .filter((p) => p.current_room_view === currentStageObj.stageNum)
-                    .map((p) => {
-                      const av = getAvatarObj(p.avatar_id);
-                      return (
-                        <span
-                          key={p.player_uid}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-800 text-xs font-bold text-slate-200 border border-slate-700"
-                        >
-                          <span>{av.emoji}</span>
-                          <span>{p.nickname}</span>
-                        </span>
-                      );
-                    })}
-                </div>
-
-                {room.unlocked_stages.includes(currentStageObj.stageNum + 1) && (
-                  <button
-                    type="button"
-                    onClick={() => handleSelectStage(currentStageObj.stageNum + 1)}
-                    className="px-3 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs cursor-pointer"
-                  >
-                    제{currentStageObj.stageNum + 1}방으로 이동 →
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Always-Visible Overall Escape Map */}
+          {/* 3. Always-Visible Overall Escape Map */}
           <FacilityMap
             currentStage={room.current_stage}
             unlockedStages={room.unlocked_stages}
@@ -1136,9 +1038,8 @@ export function App() {
           />
         </div>
 
-        {/* RIGHT COLUMN (4 cols): Team Status, Collected Clues & Live Team Chat/Logs */}
+        {/* RIGHT COLUMN (4 cols): Team Status & Live Team Walkie-Talkie */}
         <div className="lg:col-span-4 flex flex-col gap-5">
-          {/* Teammates & Avatar Status */}
           <div className="rounded-2xl border border-slate-800 bg-slate-900/95 p-4 space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="font-extrabold text-sm text-white flex items-center gap-2">
@@ -1193,15 +1094,14 @@ export function App() {
             </div>
           </div>
 
-          {/* Live Team Log & Chat Box */}
-          <div className="flex-1 rounded-2xl border border-slate-800 bg-slate-900/95 p-4 flex flex-col justify-between min-h-[340px]">
+          <div className="flex-1 rounded-2xl border border-slate-800 bg-slate-900/95 p-4 flex flex-col justify-between min-h-[360px]">
             <div>
               <h3 className="font-extrabold text-sm text-white mb-2 flex items-center justify-between">
                 <span>📡 실시간 단서 해독 무전기</span>
                 <span className="text-[11px] font-normal text-slate-400">팀원 전체 공유</span>
               </h3>
 
-              <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1 flex flex-col-reverse">
+              <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1 flex flex-col-reverse">
                 {logs.map((log) => {
                   const av = getAvatarObj(log.avatar_id);
                   const isSolve = log.event_type === 'solve' || log.event_type === 'stage_clear';
@@ -1251,13 +1151,17 @@ export function App() {
         </div>
       </main>
 
-      {/* Puzzle Modal */}
+      {/* Clue Inspection & Shuffled Quiz Modal */}
       {activePuzzle && (
         <PuzzleModal
           puzzle={activePuzzle}
           isSolved={room.solved_puzzles.includes(activePuzzle.id)}
           canSolveFinal={canSolveStageFinal}
-          onClose={() => setActivePuzzle(null)}
+          usedItemName={usedItemForModal}
+          onClose={() => {
+            setActivePuzzle(null);
+            setUsedItemForModal(null);
+          }}
           onSolveSuccess={handleSolvePuzzle}
         />
       )}
