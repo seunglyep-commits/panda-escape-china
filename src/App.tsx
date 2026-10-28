@@ -1,11 +1,17 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import confetti from 'canvas-confetti';
-import { AVATAR_OPTIONS, ESCAPE_STAGES, InventoryItem, PuzzleHotspot } from './data/escapeData';
+import {
+  AVATAR_OPTIONS,
+  ESCAPE_STAGES,
+  InventoryItem,
+  MapInteractableProp,
+  PuzzleHotspot,
+} from './data/escapeData';
 import { createRoomSupabaseClient, getPlayerCredentials } from './lib/supabase';
 import { FacilityMap, PlayerInfo } from './components/FacilityMap';
 import { PuzzleModal } from './components/PuzzleModal';
 import { TextbookGuideModal } from './components/TextbookGuideModal';
-import { InteractiveRoomScene } from './components/InteractiveRoomScene';
+import { ZepTopDownRoom } from './components/ZepTopDownRoom';
 import { InventoryBar } from './components/InventoryBar';
 import {
   Users,
@@ -23,6 +29,9 @@ import {
   ShieldAlert,
   RefreshCw,
   Volume2,
+  Timer,
+  DoorOpen,
+  FileText,
 } from 'lucide-react';
 
 interface RoomData {
@@ -76,10 +85,14 @@ export function App() {
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [activeViewStage, setActiveViewStage] = useState<number>(1);
 
-  // Point-and-Click Puzzle & Inventory State
+  // ZEP Top-Down Adventure State
   const [activePuzzle, setActivePuzzle] = useState<PuzzleHotspot | null>(null);
   const [usedItemForModal, setUsedItemForModal] = useState<string | null>(null);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [discoveredClueProps, setDiscoveredClueProps] = useState<string[]>([]);
+  const [celebrationTrigger, setCelebrationTrigger] = useState<number>(0);
+  const [shakeTrigger, setShakeTrigger] = useState<number>(0);
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(900); // 15:00 timer
 
   // Modals & UI Helpers
   const [showMapModal, setShowMapModal] = useState<boolean>(false);
@@ -96,23 +109,53 @@ export function App() {
     return AVATAR_OPTIONS.find((a) => a.id === avatarId) || AVATAR_OPTIONS[0];
   };
 
-  // Derive all collected inventory items from solved_puzzles across the team
+  // Combine discovered furniture clue notes + solved puzzle reward items into the bottom inventory!
   const collectedInventoryItems: InventoryItem[] = useMemo(() => {
-    if (!room) return [];
     const list: InventoryItem[] = [];
     for (const stage of ESCAPE_STAGES) {
-      for (const puzzle of stage.puzzles) {
-        if (room.solved_puzzles.includes(puzzle.id) && puzzle.rewardItem) {
-          list.push(puzzle.rewardItem);
+      // Furniture clue notes discovered by proximity interaction
+      for (const prop of stage.props) {
+        if (prop.kind === 'clue_note' && prop.clueItem && discoveredClueProps.includes(prop.id)) {
+          list.push(prop.clueItem);
+        }
+      }
+      // Puzzle reward keys/cards/notes
+      if (room) {
+        for (const puzzle of stage.puzzles) {
+          if (room.solved_puzzles.includes(puzzle.id) && puzzle.rewardItem) {
+            list.push(puzzle.rewardItem);
+          }
         }
       }
     }
     return list;
-  }, [room]);
+  }, [room, discoveredClueProps]);
 
   const selectedInventoryItem = useMemo(() => {
     return collectedInventoryItems.find((i) => i.id === selectedItemId) || null;
   }, [collectedInventoryItems, selectedItemId]);
+
+  // Countdown Timer (15 minutes from room.started_at)
+  useEffect(() => {
+    if (!room || room.status !== 'playing') return;
+    const updateTimer = () => {
+      if (!room.started_at) {
+        setRemainingSeconds((s) => Math.max(0, s - 1));
+        return;
+      }
+      const elapsed = Math.floor((Date.now() - new Date(room.started_at).getTime()) / 1000);
+      setRemainingSeconds(Math.max(0, 900 - elapsed));
+    };
+    updateTimer();
+    const t = setInterval(updateTimer, 1000);
+    return () => clearInterval(t);
+  }, [room]);
+
+  const formatTimer = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  };
 
   // Fetch full room state via verified RPC
   const fetchRoomState = useCallback(
@@ -126,7 +169,6 @@ export function App() {
       });
 
       if (error) {
-        console.warn('Room state fetch warning:', error.message);
         if (error.message.includes('존재하지 않는') || error.message.includes('참가 인증')) {
           localStorage.removeItem('panda_active_room');
           setActiveRoomCode(null);
@@ -143,14 +185,12 @@ export function App() {
 
         if (fetchedRoom.current_stage > prevStageRef.current) {
           prevStageRef.current = fetchedRoom.current_stage;
-          setActiveViewStage(fetchedRoom.current_stage);
-          setSelectedItemId(null);
-          confetti({ particleCount: 70, spread: 60, origin: { y: 0.6 } });
+          confetti({ particleCount: 75, spread: 65, origin: { y: 0.6 } });
         }
 
         if (fetchedRoom.status === 'completed' && prevStatusRef.current !== 'completed') {
           prevStatusRef.current = 'completed';
-          confetti({ particleCount: 140, spread: 90, origin: { y: 0.5 } });
+          confetti({ particleCount: 150, spread: 95, origin: { y: 0.5 } });
         } else {
           prevStatusRef.current = fetchedRoom.status;
         }
@@ -295,9 +335,10 @@ export function App() {
     await fetchRoomState(activeRoomCode);
   };
 
-  // Switch which room I am viewing on the map
+  // Switch which room I am viewing on the map or via Portal
   const handleSelectStage = async (stageNum: number) => {
     setActiveViewStage(stageNum);
+    setSelectedItemId(null);
     setShowMapModal(false);
     if (!activeRoomCode) return;
 
@@ -334,13 +375,26 @@ export function App() {
     }
   };
 
-  // Solve a Puzzle & Automatically Receive Reward Item in Inventory
+  // Discover a furniture Clue Note on the 2D Grid
+  const handleDiscoverClueNote = async (prop: MapInteractableProp) => {
+    if (!discoveredClueProps.includes(prop.id)) {
+      setDiscoveredClueProps((prev) => [...prev, prop.id]);
+      confetti({ particleCount: 30, spread: 45, origin: { y: 0.7 } });
+    }
+  };
+
+  // Trigger a Trap on the 2D Grid
+  const handleTriggerTrap = () => {
+    setShakeTrigger((t) => t + 1);
+  };
+
+  // Solve a Puzzle -> Fireworks above character head + Inventory reward
   const handleSolvePuzzle = async (puzzle: PuzzleHotspot) => {
     if (!activeRoomCode) return;
     const client = createRoomSupabaseClient(activeRoomCode);
     const msg = puzzle.isStageFinal
-      ? `🎉 [${nickname}] 대원이 [${puzzle.rewardItem.icon} ${puzzle.rewardItem.name}]을(를) 획득하고 제${puzzle.stageNum}방 최종 잠금장치를 해제했습니다!`
-      : `✨ [${nickname}] 대원이 [${puzzle.title}] 단서를 풀어 인벤토리 아이템 [${puzzle.rewardItem.icon} ${puzzle.rewardItem.name}]을(를) 획득했습니다!`;
+      ? `🎉 [${nickname}] 대원이 [${puzzle.title}] 암호를 풀어 제${puzzle.stageNum}방 탈출 포털 문을 열었습니다!`
+      : `✨ [${nickname}] 대원이 [${puzzle.title}] 퀴즈를 풀고 인벤토리 아이템 [${puzzle.rewardItem.icon} ${puzzle.rewardItem.name}]을(를) 획득했습니다!`;
 
     const { error } = await client.rpc('submit_puzzle_solution', {
       p_room_code: activeRoomCode,
@@ -358,7 +412,9 @@ export function App() {
       return;
     }
 
-    // Automatically select the newly acquired key/tool so the user can immediately see it in inventory
+    setCelebrationTrigger((c) => c + 1);
+    confetti({ particleCount: 65, spread: 60, origin: { y: 0.6 } });
+
     if (puzzle.rewardItem && !puzzle.isStageFinal) {
       setSelectedItemId(puzzle.rewardItem.id);
     } else {
@@ -421,12 +477,12 @@ export function App() {
               <div>
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-extrabold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    미래엔 중학교 중국어 1~3과 · 포인트 앤 클릭 방탈출
+                    ZEP QUIZ 스타일 2D 탑뷰 방탈출 · 중학교 중국어 1~3과
                   </span>
                   <span className="text-xs font-bold text-amber-300">2~5인 실시간 협동 멀티플레이</span>
                 </div>
                 <h1 className="text-lg sm:text-xl font-black tracking-tight text-white">
-                  판다 연구소 구출 작전 : 손전등과 인벤토리로 5개의 방을 탈출하라!
+                  판다 연구소 구출 작전 : 2D 캐릭터로 걸어 다니며 5개의 방을 탈출하라!
                 </h1>
               </div>
             </div>
@@ -466,10 +522,10 @@ export function App() {
                   STEP 1 · 방탈출 입장 전 필수 준비
                 </span>
                 <h2 className="text-xl sm:text-2xl font-black text-white mt-0.5">
-                  나의 구출 대원 아바타와 이름을 정해 주세요!
+                  2D 맵을 걸어 다닐 나의 아바타와 이름을 정해 주세요!
                 </h2>
                 <p className="text-xs sm:text-sm text-slate-400 mt-0.5">
-                  교과서 45쪽 ‘중국의 멸종 위기 동물’과 전통 캐릭터 중 나만의 아바타를 고르고 이름을 입력하세요.
+                  교과서 45쪽 ‘중국의 멸종 위기 동물’과 전통 캐릭터 중 나만의 2D 캐릭터를 고르고 이름을 입력하세요.
                 </p>
               </div>
 
@@ -486,7 +542,7 @@ export function App() {
 
             <div className="max-w-md">
               <label className="block text-xs sm:text-sm font-bold text-slate-200 mb-1.5">
-                내 이름 (닉네임 또는 중국어 이름)
+                내 캐릭터 이름 (닉네임 또는 중국어 이름)
               </label>
               <input
                 type="text"
@@ -597,7 +653,7 @@ export function App() {
               >
                 <Sparkles className="w-5 h-5" />
                 <span>
-                  {loadingAction ? '방 생성 중...' : `${targetPlayers}인 방탈출 방 만들고 코드 발급받기`}
+                  {loadingAction ? '방 생성 중...' : `${targetPlayers}인 ZEP 방탈출 방 만들고 코드 발급받기`}
                 </span>
               </button>
             </form>
@@ -695,7 +751,7 @@ export function App() {
                   {room.team_name} · 목표 인원 {room.target_players}인 팀 (현재 {players.length}명 접속 중)
                 </div>
                 <h1 className="text-lg sm:text-xl font-black text-white">
-                  방탈출 출발 대기실 — 친구들에게 방 코드를 알려주세요!
+                  ZEP 방탈출 출발 대기실 — 친구들에게 방 코드를 알려주세요!
                 </h1>
               </div>
             </div>
@@ -845,7 +901,7 @@ export function App() {
                   className="px-6 py-3 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-black text-sm sm:text-base shadow-lg shadow-emerald-500/25 flex items-center gap-2 cursor-pointer"
                 >
                   <Play className="w-5 h-5 fill-current" />
-                  <span>지금 바로 판다 연구소 방탈출 시작하기!</span>
+                  <span>지금 바로 ZEP 2D 방탈출 시작하기!</span>
                 </button>
               </div>
             </div>
@@ -868,12 +924,25 @@ export function App() {
   }
 
   // ============================================================================
-  // VIEW 3: POINT-AND-CLICK ESCAPE ROOM GAMEPLAY + INVENTORY + FLASHLIGHT
+  // VIEW 3: ZEP QUIZ STYLE 2D TOP-DOWN ESCAPE GAME + HUD
   // ============================================================================
   const currentStageObj = ESCAPE_STAGES.find((s) => s.stageNum === activeViewStage) || ESCAPE_STAGES[0];
   const stageNonFinalPuzzles = currentStageObj.puzzles.filter((p) => !p.isStageFinal);
   const canSolveStageFinal = stageNonFinalPuzzles.every((p) => room.solved_puzzles.includes(p.id));
-  const totalSolvedCount = room.solved_puzzles.length;
+
+  // ZEP Top HUD Metrics for Current Stage
+  const stageSolvedPuzzlesCount = currentStageObj.puzzles.filter((p) =>
+    room.solved_puzzles.includes(p.id)
+  ).length;
+  const stageCluePropsTotal = currentStageObj.props.filter((pr) => pr.kind === 'clue_note').length;
+  const stageCluePropsFound = currentStageObj.props.filter(
+    (pr) => pr.kind === 'clue_note' && discoveredClueProps.includes(pr.id)
+  ).length;
+
+  const foundCluesInStage = stageSolvedPuzzlesCount + stageCluePropsFound;
+  const totalCluesInStage = currentStageObj.puzzles.length + stageCluePropsTotal; // e.g., 4 clues per stage
+  const remainingDoorProblems = currentStageObj.puzzles.length - stageSolvedPuzzlesCount;
+
   const masterCodeSlots = [
     { stage: 1, digit: '3', puzzleId: 'r1_p1', label: '1방(3성)' },
     { stage: 2, digit: '2', puzzleId: 'r2_p1', label: '2방(bú)' },
@@ -893,68 +962,106 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      {/* Top Game HUD Header */}
-      <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur-md">
-        <div className="max-w-7xl mx-auto px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-2">
+      {/* =====================================================================
+          ZEP STYLE TOP HUD BAR (Stage Name, Found Clues, Timer, Remaining Door Problems)
+         ===================================================================== */}
+      <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/95 backdrop-blur-md">
+        <div className="max-w-7xl mx-auto px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-2.5">
+          {/* 1. Stage Name & PIN */}
           <div className="flex items-center gap-2.5">
-            <span className="text-2xl">🐼</span>
+            <div className="w-9 h-9 rounded-xl bg-emerald-500/20 border border-emerald-400/40 flex items-center justify-center text-xl">
+              🐼
+            </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className="font-extrabold text-sm text-white">{room.team_name}</span>
+                <span className="font-black text-sm sm:text-base text-white">{currentStageObj.name}</span>
                 <button
                   type="button"
                   onClick={handleCopyPin}
                   className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-400/40 font-mono text-xs font-bold cursor-pointer"
                 >
-                  <span>코드: {room.room_code}</span>
+                  <span>PIN: {room.room_code}</span>
                   {copiedCode ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
                 </button>
               </div>
               <div className="text-[11px] text-slate-400">
-                전체 단서 해독: <strong className="text-emerald-400">{totalSolvedCount} / 15</strong> · 팀 점수:{' '}
+                팀: <strong className="text-slate-200">{room.team_name}</strong> · 점수:{' '}
                 <strong className="text-amber-300">{room.score}점</strong>
               </div>
             </div>
           </div>
 
-          {/* 5-Digit Master Code Tracker */}
-          <div className="flex items-center gap-1.5 bg-slate-900 px-3 py-1.5 rounded-2xl border border-slate-800">
-            <span className="text-[11px] font-bold text-slate-400 mr-1 hidden sm:inline">마스터 코드:</span>
-            {masterCodeSlots.map((slot) => {
-              const unlocked = room.solved_puzzles.includes(slot.puzzleId);
-              return (
-                <div
-                  key={slot.stage}
-                  title={slot.label}
-                  className={`w-7 h-8 rounded-lg flex flex-col items-center justify-center border font-mono text-xs font-black ${
-                    unlocked
-                      ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
-                      : 'bg-slate-950 border-slate-800 text-slate-600'
-                  }`}
-                >
-                  <span>{unlocked ? slot.digit : '?'}</span>
-                </div>
-              );
-            })}
+          {/* 2. ZEP Core HUD Badges: Found Clues, Remaining Door Problems, Timer */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Found Clues Count */}
+            <div className="px-3 py-1.5 rounded-xl bg-slate-900 border border-emerald-500/40 flex items-center gap-1.5 text-xs font-extrabold">
+              <FileText className="w-4 h-4 text-emerald-400" />
+              <span className="text-slate-300">찾은 단서:</span>
+              <span className="text-emerald-300 font-mono">
+                {foundCluesInStage}/{totalCluesInStage}
+              </span>
+            </div>
+
+            {/* Remaining Problems to Unlock Portal Door */}
+            <div
+              className={`px-3 py-1.5 rounded-xl border flex items-center gap-1.5 text-xs font-extrabold ${
+                remainingDoorProblems === 0
+                  ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                  : 'bg-slate-900 border-amber-500/40 text-amber-300'
+              }`}
+            >
+              <DoorOpen className="w-4 h-4" />
+              <span>
+                {remainingDoorProblems === 0
+                  ? '포털 문 OPEN! (오른쪽 문으로 이동)'
+                  : `잠긴 문까지 남은 문제: ${remainingDoorProblems}개`}
+              </span>
+            </div>
+
+            {/* Remaining Time Timer */}
+            <div className="px-3 py-1.5 rounded-xl bg-slate-900 border border-cyan-500/40 flex items-center gap-1.5 text-xs font-mono font-black text-cyan-300">
+              <Timer className="w-4 h-4 text-cyan-400" />
+              <span>{formatTimer(remainingSeconds)}</span>
+            </div>
+
+            {/* 5-Digit Master Code Mini Slots */}
+            <div className="hidden xl:flex items-center gap-1 bg-slate-900 px-2.5 py-1 rounded-xl border border-slate-800">
+              {masterCodeSlots.map((slot) => {
+                const unlocked = room.solved_puzzles.includes(slot.puzzleId);
+                return (
+                  <div
+                    key={slot.stage}
+                    title={slot.label}
+                    className={`w-6 h-7 rounded flex items-center justify-center border font-mono text-xs font-black ${
+                      unlocked
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                        : 'bg-slate-950 border-slate-800 text-slate-600'
+                    }`}
+                  >
+                    {unlocked ? slot.digit : '?'}
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
-          {/* Action Buttons */}
-          <div className="flex items-center gap-2">
+          {/* 3. Utility Buttons */}
+          <div className="flex items-center gap-1.5">
             <button
               type="button"
               onClick={() => setShowMapModal(true)}
-              className="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-400/40 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-400/40 text-xs font-bold flex items-center gap-1 cursor-pointer"
             >
-              <MapIcon className="w-4 h-4" />
-              <span>전체 맵 크게 보기</span>
+              <MapIcon className="w-3.5 h-3.5" />
+              <span>전체 맵</span>
             </button>
             <button
               type="button"
               onClick={() => setShowGuideModal(true)}
-              className="px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-400/40 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-400/40 text-xs font-bold flex items-center gap-1 cursor-pointer"
             >
-              <BookOpen className="w-4 h-4" />
-              <span>1~3과 단서 사전</span>
+              <BookOpen className="w-3.5 h-3.5" />
+              <span>단서 사전</span>
             </button>
             <button
               type="button"
@@ -1002,23 +1109,30 @@ export function App() {
 
       {/* Main Content Grid */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-5 py-4 grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* LEFT/CENTER COLUMN (8 cols): Point-and-Click Room View + Bottom Inventory Bar + Full Escape Map */}
+        {/* LEFT/CENTER COLUMN (8 cols): ZEP 2D Top-Down Grid Map + Bottom Inventory Bar + Full Map */}
         <div className="lg:col-span-8 space-y-4">
-          {/* 1. Point-and-Click Room View with Radial-Gradient Flashlight */}
-          <InteractiveRoomScene
+          {/* 1. ZEP 2D Top-Down Grid Room Adventure */}
+          <ZepTopDownRoom
             stage={currentStageObj}
+            myNickname={nickname}
+            myAvatarId={selectedAvatar}
             solvedPuzzles={room.solved_puzzles}
             unlockedStages={room.unlocked_stages}
             selectedItem={selectedInventoryItem}
             playersInRoom={players.filter((p) => p.current_room_view === currentStageObj.stageNum)}
+            isModalOpen={Boolean(activePuzzle) || showMapModal || showGuideModal}
+            celebrationTrigger={celebrationTrigger}
+            shakeTrigger={shakeTrigger}
             onOpenPuzzle={(puzzle, usedItemName) => {
               setUsedItemForModal(usedItemName || null);
               setActivePuzzle(puzzle);
             }}
-            onSelectStage={handleSelectStage}
+            onDiscoverClueNote={handleDiscoverClueNote}
+            onTriggerTrap={handleTriggerTrap}
+            onEnterNextStagePortal={handleSelectStage}
           />
 
-          {/* 2. Bottom Inventory Bar (Item Selection, Combination, Inspection) */}
+          {/* 2. ZEP Bottom HUD Inventory Bar (Clue Notes + Keys + Item Combination) */}
           <InventoryBar
             items={collectedInventoryItems}
             selectedItemId={selectedItemId}
@@ -1163,6 +1277,7 @@ export function App() {
             setUsedItemForModal(null);
           }}
           onSolveSuccess={handleSolvePuzzle}
+          onWrongAnswer={() => setShakeTrigger((t) => t + 1)}
         />
       )}
 

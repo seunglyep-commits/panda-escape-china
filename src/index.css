@@ -5,3 +5,23 @@
     font-family: 'Noto Sans KR', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, sans-serif;
   }
 }
+
+@keyframes zepShake {
+  0%, 100% { transform: translate3d(0, 0, 0); }
+  15%, 45%, 75% { transform: translate3d(-7px, 2px, 0); }
+  30%, 60%, 90% { transform: translate3d(7px, -2px, 0); }
+}
+
+@keyframes zepFloatUp {
+  0% { opacity: 1; transform: translateY(0) scale(0.9); }
+  50% { opacity: 1; transform: translateY(-20px) scale(1.08); }
+  100% { opacity: 0; transform: translateY(-38px) scale(1); }
+}
+
+.animate-zep-shake {
+  animation: zepShake 0.48s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+}
+
+.animate-zep-float {
+  animation: zepFloatUp 1.8s ease-out forwards;
+}
